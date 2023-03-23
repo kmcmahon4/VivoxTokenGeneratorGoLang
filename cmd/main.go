@@ -22,6 +22,7 @@ const (
 	TokenHeader = "e30"
 	ActionJoin  = "join"
 	ActionLogin = "login"
+	ActionKick  = "kick"
 )
 
 type TokenGenerationArgs struct {
@@ -34,21 +35,14 @@ type TokenGenerationArgs struct {
 	Action        string
 }
 
-type VivoxLoginJwt struct {
-	Issuer        string `json:"iss"`
-	Expiration    int    `json:"exp"`
-	VivoxAction   string `json:"vxa"`
-	VivoxUniqueId int64  `json:"vxi"`
-	From          string `json:"f"`
-}
-
-type VivoxJoinJwt struct {
+type Claims struct {
 	Issuer        string `json:"iss"`
 	Expiration    int    `json:"exp"`
 	VivoxAction   string `json:"vxa"`
 	VivoxUniqueId int64  `json:"vxi"`
 	From          string `json:"f"`
 	To            string `json:"t"`
+	Subject       string `json:"sub"`
 }
 
 var logger, _ = zap.NewProduction()
@@ -59,29 +53,22 @@ func main() {
 		log.Fatal("error loading config file")
 	}
 
-	// get args
-	issuer := os.Getenv("VIVOX_ISSUER")
-	domain := os.Getenv("VIVOX_DOMAIN")
 	tokenDuration, _ := strconv.Atoi(os.Getenv("TOKEN_DURATION_SECONDS"))
-	userId := os.Getenv("VIVOX_USER_ID")
-	channelId := os.Getenv("VIVOX_CHANNEL_ID")
-	key := os.Getenv("VIVOX_KEY")
-	action := os.Getenv("VIVOX_ACTION")
 
 	args := &TokenGenerationArgs{
-		Issuer:        issuer,
-		Domain:        domain,
+		Issuer:        os.Getenv("VIVOX_ISSUER"),
+		Domain:        os.Getenv("VIVOX_DOMAIN"),
 		TokenDuration: tokenDuration,
-		UserID:        userId,
-		ChannelId:     channelId,
-		Key:           key,
-		Action:        action,
+		UserID:        os.Getenv("VIVOX_USER_ID"),
+		ChannelId:     os.Getenv("VIVOX_CHANNEL_ID"),
+		Key:           os.Getenv("VIVOX_KEY"),
+		Action:        os.Getenv("VIVOX_ACTION"),
 	}
 
 	tokenGenerator := NewTokenGenerator()
 
 	// just log it to console for now
-	// auto copy to clipboard?
+	// Todo: auto copy to clipboard?
 	logger.Info(tokenGenerator.GenerateToken(*args))
 }
 
@@ -89,14 +76,13 @@ type TokenGenerator interface {
 	GenerateToken(args TokenGenerationArgs) string
 	base64URLEncode(bytes []byte) string
 	sha256Hash(secret string, message string) string
-	generateUniquId() int64
+	generateUniqueId() int64
 	generatePlayerSIP(issuer string, domain string, playerId string) string
 	generateChannelSIP(issuer string, domain string, channelName string) string
 	generateExpiration(durationInSeconds int) int
 }
 
-type tokenGenerator struct {
-}
+type tokenGenerator struct{}
 
 func NewTokenGenerator() TokenGenerator {
 	return &tokenGenerator{}
@@ -112,45 +98,41 @@ func (t *tokenGenerator) GenerateToken(args TokenGenerationArgs) string {
 		return emptyString
 	}
 
+	// Header, payload, signature (this is a JWT!)
 	tokenSegments := make([]string, 0, 3)
 
+	// Header
 	tokenSegments = append(tokenSegments, TokenHeader)
 
-	var jsonToConvert any
-
-	// construct JSON object to encode
-	if args.Action == ActionLogin {
-		jsonToConvert = &VivoxLoginJwt{
-			Issuer:        args.Issuer,
-			Expiration:    t.generateExpiration(args.TokenDuration),
-			VivoxAction:   args.Action,
-			VivoxUniqueId: t.generateUniquId(),
-			From:          t.generatePlayerSIP(args.Issuer, args.Domain, args.UserID),
-		}
+	claims := &Claims{
+		Issuer:        args.Issuer,
+		Expiration:    t.generateExpiration(args.TokenDuration),
+		VivoxAction:   args.Action,
+		VivoxUniqueId: t.generateUniqueId(),
+		From:          t.generatePlayerSIP(args.Issuer, args.Domain, args.UserID),
 	}
 
-	if args.Action == ActionJoin {
-		jsonToConvert = &VivoxJoinJwt{
-			Issuer:        args.Issuer,
-			Expiration:    t.generateExpiration(args.TokenDuration),
-			VivoxAction:   args.Action,
-			VivoxUniqueId: t.generateUniquId(),
-			From:          t.generatePlayerSIP(args.Issuer, args.Domain, args.UserID),
-			To:            t.generateChannelSIP(args.Issuer, args.Domain, args.ChannelId),
-		}
+	if args.Action != ActionLogin {
+		claims.To = t.generatePlayerSIP(args.Issuer, args.Domain, args.ChannelId)
 	}
 
-	bytes, err := json.Marshal(jsonToConvert)
+	if args.Action != ActionLogin && args.Action != ActionJoin {
+		// set subject - for server-server API tokens
+	}
+
+	// payload
+	claimsBytes, err := json.Marshal(claims)
 	if err != nil {
 		return emptyString
 	}
+	encodedPayload := t.base64URLEncode(claimsBytes)
 
-	encodedPayload := t.base64URLEncode(bytes)
 	tokenSegments = append(tokenSegments, encodedPayload)
 
+	// signature
 	toSign := strings.Join(tokenSegments, ".")
-
 	signature := t.sha256Hash(args.Key, toSign)
+
 	tokenSegments = append(tokenSegments, signature)
 
 	token := strings.Join(tokenSegments, ".")
@@ -178,7 +160,7 @@ func (t *tokenGenerator) base64URLEncode(bytes []byte) string {
 	return encodedString
 }
 
-func (t *tokenGenerator) generateUniquId() int64 {
+func (t *tokenGenerator) generateUniqueId() int64 {
 	return time.Now().UnixNano()
 }
 
@@ -195,7 +177,7 @@ func (t *tokenGenerator) generateChannelSIP(issuer string, domain string, channe
 }
 
 func (t *tokenGenerator) generateExpiration(durationInSeconds int) int {
-	return int(time.Now().Add((time.Second * time.Duration(durationInSeconds))).Unix())
+	return int(time.Now().Add(time.Second * time.Duration(durationInSeconds)).Unix())
 }
 
 func (t *TokenGenerationArgs) validate() error {
